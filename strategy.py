@@ -16,7 +16,7 @@ logger = logging.getLogger(__name__)
 
 # ── Maker placement ────────────────────────────────────────────────────────────
 
-def try_place_new_makers(
+def try_place_new_makers_original(
     manager: TradingManager,
     event,
     client,
@@ -115,6 +115,121 @@ def try_place_new_makers(
                     "[strategy] Placed maker in '%s' @ %.4f | size=%.2f | edge=%.4f | spread=%.4f",
                     event.title, our_bid, target_size, edge, spread,
                 )
+
+import math
+
+def try_place_new_makers(
+    manager: TradingManager,
+    event,
+    client,
+    cash_usdc: float = 0.0,
+) -> None:
+    """Evaluate a neg-risk event and post limit BUY orders on NO tokens."""
+    no_token_ids = event.get_all_no_tokens()
+    if not no_token_ids:
+        return
+
+    book_params = [BookParams(token_id=tid) for tid in no_token_ids]
+    try:
+        books = client.get_order_books(params=book_params)
+    except Exception as exc:
+        logger.warning("[strategy] Order books fetch failed for '%s': %s", event.title, exc)
+        return
+
+    if len(books) != len(no_token_ids):
+        return
+
+    # ── Pass 1: compute aggregate stats and refresh token snapshots ────────────
+    price_sum = 0.0
+    min_ask_size = float("inf")
+    min_ask_price = 1.0
+    valid_books = []
+
+    for book in books:
+        if not book.asks:
+            return  # any missing book aborts the whole event
+        ask = book.asks[-1]
+        p = float(ask.price)
+        s = float(ask.size)
+        best_bid = float(book.bids[-1].price) if book.bids else 0.0
+
+        price_sum += p
+        min_ask_size = min(min_ask_size, s)
+        min_ask_price = min(min_ask_price, p)
+
+        # Refresh token snapshot
+        if book.asset_id not in manager.tokens:
+            market = manager.get_market_by_token(book.asset_id)
+            cid = market.market_id if market else ""
+            manager.tokens[book.asset_id] = MarketToken(
+                condition_id=cid, token_id=book.asset_id, token_type="NO",
+                best_bid=best_bid, best_ask=p,
+            )
+        else:
+            token = manager.tokens[book.asset_id]
+            token.best_ask = p
+            token.best_bid = best_bid
+
+        valid_books.append(book)
+
+    # Guard: skip events with illiquid or tiny markets
+    if min_ask_size < 5 or min_ask_price * min_ask_size < 1:
+        return
+
+    # ── Pass 2: place a maker order per token ─────────────────────────────────
+    for book in valid_books:
+        market = manager.get_market_by_token(book.asset_id)
+        if not market:
+            continue
+
+        min_tick = market.min_tick
+        initial_ask = float(book.asks[-1].price)
+        initial_bid = float(book.bids[-1].price) if book.bids else 0.0
+
+        # Theoretical fair-value bid for this leg
+        theoretical = len(no_token_ids) - 1 - (price_sum - initial_ask) - min_tick - 0.001
+
+        spread = initial_ask - initial_bid
+        blended_bid = initial_bid + 0.4 * spread
+        our_bid = min(theoretical, blended_bid)
+        our_bid = math.floor(our_bid / min_tick) * min_tick
+
+        edge = theoretical - our_bid
+        
+        # Calculate the minimum ask size of the *remaining* markets
+        remaining_ask_sizes = [
+            float(b.asks[-1].size) 
+            for b in valid_books 
+            if b.asset_id != book.asset_id
+        ]
+        
+        # Fallback to current size if it's somehow the only book (unlikely in neg-risk)
+        min_remaining_size = min(remaining_ask_sizes) if remaining_ask_sizes else float(book.asks[-1].size)
+
+        # Target size is constrained by the remaining liquidity and available cash
+        target_size = min(min_remaining_size, cash_usdc / len(no_token_ids))
+
+        if target_size < 5:
+            logger.debug("[strategy] Skipping %s — target_size too small (%.2f)", book.asset_id, target_size)
+            continue
+
+        if our_bid >= initial_bid - 1e-6:
+            placed = manager.place_order(
+                token_id=book.asset_id,
+                price=our_bid,
+                size=target_size,
+                side=OrderSide.BUY,
+                initial_market_bid=initial_bid,
+                initial_market_ask=initial_ask,
+                client=client,
+            )
+            if placed:
+                manager.mark_event_interesting(event.event_id)
+                logger.info(
+                    "[strategy] Placed maker in '%s' @ %.4f | size=%.2f | edge=%.4f | spread=%.4f",
+                    event.title, our_bid, target_size, edge, spread,
+                )
+
 
 
 # ── Main trading loop ──────────────────────────────────────────────────────────

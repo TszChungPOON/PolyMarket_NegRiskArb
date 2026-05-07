@@ -32,11 +32,13 @@ def start_user_websocket(mgr: TradingManager) -> None:
         mgr.last_ws_message_time = time.time()
         if not message.strip():
             return
+        if message == "PONG":
+            return
         try:
             data = json.loads(message)
             _process_user_message(mgr, data)
         except json.JSONDecodeError as exc:
-            logger.warning("[UserWS] JSON decode failed: %s", exc)
+            logger.warning("[UserWS] JSON decode failed: %s | message: %s", exc, message)
         except Exception as exc:
             logger.error("[UserWS] Processing error: %s", exc)
 
@@ -102,11 +104,16 @@ def start_market_websocket(mgr: TradingManager) -> None:
 
     def on_message(ws, message: str):
         mgr.last_ws_message_time = time.time()
+        if message == "PONG":
+            return
         try:
             data = json.loads(message)
             _process_market_message(mgr, data)
+        except json.JSONDecodeError as exc:
+            logger.warning("[MarketWS] JSON decode failed: %s | message: %s", exc, message)
         except Exception as exc:
-            logger.error("[MarketWS] Error processing: %s", exc)
+            logger.error("[MarketWS] Processing error: %s", exc)
+            
 
     def on_error(ws, error):
         logger.error("[MarketWS] Error: %s", error)
@@ -171,7 +178,7 @@ def _send_subscription(mgr: TradingManager, token_ids: list, operation: str) -> 
 
 def _process_user_message(mgr: TradingManager, data: dict) -> None:
     from orders import hedge_event  # local import to avoid circular dependency
-
+#2026-04-09 00:27:57 [WARNING] ws_manager: [UserWS] JSON decode failed: Expecting value: line 1 column 1 (char 0) | message: PONG
     event_type = data.get("event_type")
 
     if event_type == "order":
@@ -210,10 +217,12 @@ def _process_user_message(mgr: TradingManager, data: dict) -> None:
             order.last_checked = time.time()
 
             if status in ("MATCHED", "MINED", "CONFIRMED"):
-                logger.info("[UserWS] Trade %s for order %s — matched %s", status, order_id, matched)
+                logger.warning("[UserWS] Trade %s for order %s — matched %s", status, order_id, matched)
                 event = mgr.events.get(order.event_id)
                 if event:
                     hedge_event(mgr, event, mgr.client)
+                else:
+                    logger.warning("[USERWS] Trade triggered but no active event associated")
             elif status in ("FAILED", "RETRYING"):
                 logger.warning("[UserWS] Trade issue (%s) for token %s", status, token_id)
                 event = mgr.events.get(order.event_id)
@@ -264,7 +273,7 @@ def _process_market_message(mgr: TradingManager, data) -> None:
                     initial_ask = token_obj.best_ask
 
                 if initial_ask is not None and new_best_ask > initial_ask + 0.001:
-                    logger.info(
+                    logger.warning(
                         "[MarketWS] ASK WORSENED on %s: %.4f → %.4f",
                         token_id, initial_ask, new_best_ask,
                     )
