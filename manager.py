@@ -270,9 +270,8 @@ class TradingManager:
         }
 
     def get_price(self, token_id: str) -> float:
-        from py_clob_client.clob_types import BookParams
-        book_param = BookParams(token_id=token_id)
-        books = self.client.get_order_books(params=[book_param])
+        from utils import fetch_order_books
+        books = fetch_order_books(self.client, [token_id])
         return float(books[0].asks[-1].price) if books and books[0].asks else 0.999
 
     # ── Order clean-up ─────────────────────────────────────────────────────────

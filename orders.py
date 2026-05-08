@@ -9,7 +9,9 @@ import logging
 import time
 from typing import TYPE_CHECKING, List, Optional
 
-from py_clob_client.clob_types import OrderArgs, PostOrdersArgs, OrderType, BookParams
+from py_clob_client_v2.clob_types import OrderArgs, PostOrdersV2Args as PostOrdersArgs, OrderType, OrderPayload
+from py_clob_client_v2.exceptions import PolyApiException
+from utils import fetch_order_books
 
 from models import MarketToken, OrderRecord, OrderSide, OrderStatus
 
@@ -56,6 +58,19 @@ def place_order(
     try:
         signed = client.create_order(order_args)
         resp = client.post_order(signed, OrderType.GTD)
+    except PolyApiException as exc:
+        if "order_version_mismatch" in str(exc.error_msg):
+            logger.warning("[orders] order_version_mismatch for %s — refreshing version and retrying", token_id)
+            try:
+                client._ClobClient__cached_version = None  # force version cache clear
+                signed = client.create_order(order_args)
+                resp = client.post_order(signed, OrderType.GTD)
+            except Exception as retry_exc:
+                logger.error("[orders] Retry failed for token %s: %s", token_id, retry_exc)
+                return None
+        else:
+            logger.error("[orders] Error placing order for token %s: %s", token_id, exc)
+            return None
     except Exception as exc:
         logger.error("[orders] Error placing order for token %s: %s", token_id, exc)
         return None
@@ -110,7 +125,7 @@ def cancel_order(mgr: TradingManager, token_id: str, client) -> None:
     event_id = order.event_id
 
     try:
-        resp = client.cancel(order_id=order.order_id)
+        resp = client.cancel_order(OrderPayload(orderID=order.order_id))
         logger.info("[orders] Cancel %s → %s", order.order_id, resp)
         order.status = OrderStatus.CANCELLED
     except Exception as exc:
@@ -239,8 +254,7 @@ def hedge_event(mgr: TradingManager, event: "Event", client) -> bool:
 
 
 def _get_best_ask(mgr: TradingManager, token_id: str) -> float:
-    book_param = BookParams(token_id=token_id)
-    books = mgr.client.get_order_books(params=[book_param])
+    books = fetch_order_books(mgr.client, [token_id])
     return float(books[0].asks[-1].price) if books and books[0].asks else 0.999
 
 
@@ -249,8 +263,17 @@ def _place_hedge_order(mgr: TradingManager, client, token_id: str, price: float,
         price=price, size=size, side="BUY",
         token_id=token_id, expiration=int(time.time()) + 700,
     )
-    signed = client.create_order(order_args)
-    resp = client.post_order(signed, OrderType.GTD)
+    try:
+        signed = client.create_order(order_args)
+        resp = client.post_order(signed, OrderType.GTD)
+    except PolyApiException as exc:
+        if "order_version_mismatch" in str(exc.error_msg):
+            logger.warning("[hedge] order_version_mismatch for %s — refreshing version and retrying", token_id)
+            client._ClobClient__cached_version = None
+            signed = client.create_order(order_args)
+            resp = client.post_order(signed, OrderType.GTD)
+        else:
+            raise
     making = float(resp.get("makingAmount", size * price))
     mgr.update_position(token_id, size, making)
     logger.info("[hedge] Hedged %.2f of token %s at %.4f (USD %.2f)", size, token_id, price, making)
@@ -261,8 +284,7 @@ def _hedge_unfilled(mgr: TradingManager, client, token_ids: List[str], size: flo
     BATCH = 15
     total = 0.0
 
-    book_params = [BookParams(token_id=t) for t in token_ids]
-    books = client.get_order_books(params=book_params)
+    books = fetch_order_books(client, token_ids)
 
     post_args: List[PostOrdersArgs] = []
     orders_info: List[dict] = []

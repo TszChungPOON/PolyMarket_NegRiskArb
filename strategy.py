@@ -6,10 +6,11 @@ import math
 import time
 from typing import Optional
 
-from py_clob_client.clob_types import BalanceAllowanceParams, AssetType, BookParams
+from py_clob_client_v2.clob_types import BalanceAllowanceParams, AssetType
 
 from models import MarketToken, OrderSide
 from manager import TradingManager
+from utils import fetch_order_books
 
 logger = logging.getLogger(__name__)
 
@@ -27,9 +28,8 @@ def try_place_new_makers_original(
     if not no_token_ids:
         return
 
-    book_params = [BookParams(token_id=tid) for tid in no_token_ids]
     try:
-        books = client.get_order_books(params=book_params)
+        books = fetch_order_books(client, no_token_ids)
     except Exception as exc:
         logger.warning("[strategy] Order books fetch failed for '%s': %s", event.title, exc)
         return
@@ -129,9 +129,8 @@ def try_place_new_makers(
     if not no_token_ids:
         return
 
-    book_params = [BookParams(token_id=tid) for tid in no_token_ids]
     try:
-        books = client.get_order_books(params=book_params)
+        books = fetch_order_books(client, no_token_ids)
     except Exception as exc:
         logger.warning("[strategy] Order books fetch failed for '%s': %s", event.title, exc)
         return

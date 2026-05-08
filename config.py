@@ -1,8 +1,8 @@
 import os
 import logging
 from dotenv import load_dotenv
-from py_clob_client.constants import POLYGON
-from py_clob_client.client import ClobClient
+from py_clob_client_v2.constants import POLYGON
+from py_clob_client_v2.client import ClobClient
 
 load_dotenv()
 
@@ -35,7 +35,7 @@ MAX_MARKETS: int = 3000
 
 # ── Build the shared client + API creds ───────────────────────────────────────
 client = ClobClient(HOST, key=PRIVATE_KEY, chain_id=CHAIN_ID, signature_type=1, funder=FUNDER)
-api_creds = client.create_or_derive_api_creds()
+api_creds = client.create_or_derive_api_key()
 client.set_api_creds(api_creds)
 
 logger.info("Polymarket client initialised")
