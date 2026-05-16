@@ -177,123 +177,185 @@ def _send_subscription(mgr: TradingManager, token_ids: list, operation: str) -> 
 # ── Message processors ─────────────────────────────────────────────────────────
 
 def _process_user_message(mgr: TradingManager, data: dict) -> None:
+    """Handle a user-channel message: order updates and trade fills."""
     from orders import hedge_event  # local import to avoid circular dependency
-#2026-04-09 00:27:57 [WARNING] ws_manager: [UserWS] JSON decode failed: Expecting value: line 1 column 1 (char 0) | message: PONG
+
     event_type = data.get("event_type")
 
-    if event_type == "order":
-        order_id = data.get("id")
-        token_id = mgr.order_id_mapping.get(order_id)
-        if not token_id or token_id not in mgr.active_orders:
-            return
-
-        order = mgr.active_orders[token_id]
-        order.matched_amount = float(data.get("size_matched", 0))
-        order.last_checked = time.time()
-        status_type = data.get("type")
-
-        if status_type == "CANCELLATION":
-            order.status = mgr._OrderStatus_CANCELLED()
-            logger.info("[UserWS] Order %s CANCELLED for token %s", order_id, token_id)
-            mgr.order_id_mapping.pop(order_id, None)
-        elif status_type == "UPDATE" and order.matched_amount > 0:
-            logger.info("[UserWS] Partial fill %s / %s for %s", order.matched_amount, order.size, token_id)
-            event = mgr.events.get(order.event_id)
-            if event:
-                hedge_event(mgr, event, mgr.client)
-        order.raw_response = data
-
-    elif event_type == "trade":
-        status = data.get("status")
-        for mo in data.get("maker_orders", []):
-            order_id = mo.get("order_id")
+    with mgr.lock:
+        if event_type == "order":
+            order_id = data.get("id")
             token_id = mgr.order_id_mapping.get(order_id)
             if not token_id or token_id not in mgr.active_orders:
-                continue
+                return
 
             order = mgr.active_orders[token_id]
-            matched = float(mo.get("matched_amount", 0))
-            order.matched_amount = (order.matched_amount or 0) + matched
+            order.matched_amount = float(data.get("size_matched", 0) or 0)
             order.last_checked = time.time()
+            status_type = data.get("type")
 
-            if status in ("MATCHED", "MINED", "CONFIRMED"):
-                logger.warning("[UserWS] Trade %s for order %s — matched %s", status, order_id, matched)
+            if status_type == "CANCELLATION":
+                order.status = mgr._OrderStatus_CANCELLED()
+                logger.info("[UserWS] Order %s CANCELLED for token %s", order_id, token_id)
+                mgr.order_id_mapping.pop(order_id, None)
+            elif status_type == "UPDATE" and order.matched_amount > 0:
+                logger.info("[UserWS] Partial fill %s / %s for %s",
+                            order.matched_amount, order.size, token_id)
                 event = mgr.events.get(order.event_id)
                 if event:
                     hedge_event(mgr, event, mgr.client)
-                else:
-                    logger.warning("[USERWS] Trade triggered but no active event associated")
-            elif status in ("FAILED", "RETRYING"):
-                logger.warning("[UserWS] Trade issue (%s) for token %s", status, token_id)
-                event = mgr.events.get(order.event_id)
-                from api import send_telegram
-                from config import TG_TOKEN, CHAT_ID
-                send_telegram(
-                    TG_TOKEN, CHAT_ID,
-                    f"Trade Failed for order {order_id} in event {event.title if event else 'unknown'}"
-                )
+            order.raw_response = data
+
+        elif event_type == "trade":
+            status = data.get("status")
+            for mo in data.get("maker_orders", []):
+                order_id = mo.get("order_id")
+                token_id = mgr.order_id_mapping.get(order_id)
+                if not token_id or token_id not in mgr.active_orders:
+                    continue
+
+                order = mgr.active_orders[token_id]
+                matched = float(mo.get("matched_amount", 0) or 0)
+                order.matched_amount = (order.matched_amount or 0) + matched
+                order.last_checked = time.time()
+
+                if status in ("MATCHED", "MINED", "CONFIRMED"):
+                    logger.warning("[UserWS] Trade %s for order %s — matched %s",
+                                   status, order_id, matched)
+                    event = mgr.events.get(order.event_id)
+                    if event:
+                        hedge_event(mgr, event, mgr.client)
+                    else:
+                        logger.warning("[UserWS] Trade triggered but no active event associated")
+                elif status in ("FAILED", "RETRYING"):
+                    logger.warning("[UserWS] Trade issue (%s) for token %s", status, token_id)
+                    event = mgr.events.get(order.event_id)
+                    from api import send_telegram
+                    from config import TG_TOKEN, CHAT_ID
+                    send_telegram(
+                        TG_TOKEN, CHAT_ID,
+                        f"Trade {status} for order {order_id} in event "
+                        f"{event.title if event else 'unknown'}"
+                    )
+                    # On terminal failure, reconcile: cancel makers, re-poll, re-hedge.
+                    if status == "FAILED" and event:
+                        hedge_event(mgr, event, mgr.client)
 
 
 def _process_market_message(mgr: TradingManager, data) -> None:
+    """Handle market-channel messages: refresh price snapshots, re-quote on moves."""
     from strategy import try_place_new_makers
+    from orders import cancel_orders
+    from config import REQUOTE_MIN_SECONDS
 
     if not isinstance(data, (dict, list)):
         return  # heartbeat / unexpected
 
     messages = data if isinstance(data, list) else [data]
 
-    for msg in messages:
-        event_type = msg.get("event_type")
-        if not event_type:
+    with mgr.lock:
+        for msg in messages:
+            event_type = msg.get("event_type")
+            if not event_type:
+                continue
+
+            if event_type == "price_change":
+                # Refresh every touched NO token's snapshot so quotes never go
+                # stale, then decide re-quotes once per event (deduped + debounced).
+                events_to_check: set = set()
+                for price_update in msg.get("price_changes", []):
+                    token_id = price_update.get("asset_id")
+                    if not token_id:
+                        continue
+                    token_obj = mgr.tokens.get(token_id)
+                    if not token_obj:
+                        continue
+                    _apply_price_update(token_obj, price_update)
+                    if token_obj.token_type != "NO":
+                        continue
+                    event = mgr.get_event_by_token(token_id)
+                    if not event:
+                        continue
+                    if any(o.event_id == event.event_id for o in mgr.active_orders.values()):
+                        events_to_check.add(event.event_id)
+
+                for event_id in events_to_check:
+                    event = mgr.events.get(event_id)
+                    if not event:
+                        continue
+                    if _event_needs_requote(mgr, event) and \
+                            mgr.should_check_event_now(event_id, REQUOTE_MIN_SECONDS):
+                        logger.info("[MarketWS] Re-quoting '%s' — cross-market price moved",
+                                    event.title)
+                        cancel_orders(mgr, event.get_all_no_tokens(), mgr.client)
+                        try_place_new_makers(mgr, event, mgr.client, cash_usdc=mgr.cash_usdc)
+
+            elif event_type == "book":
+                pass  # price_change is the live feed; book snapshots are redundant
+
+            elif event_type in ("subscribed", "unsubscribed"):
+                logger.info("[MarketWS] Subscription ack: %s", msg)
+
+            elif event_type == "last_trade_price":
+                pass  # intentionally ignored
+
+            else:
+                logger.debug("[MarketWS] Unknown event_type '%s'", event_type)
+
+
+def _apply_price_update(token_obj, price_update: dict) -> None:
+    """Refresh a token's best bid/ask from a price_change update."""
+    ba = price_update.get("best_ask")
+    bb = price_update.get("best_bid")
+    if ba is not None:
+        try:
+            token_obj.best_ask = float(ba)
+        except (TypeError, ValueError):
+            pass
+    if bb is not None:
+        try:
+            token_obj.best_bid = float(bb)
+        except (TypeError, ValueError):
+            pass
+
+
+def _event_needs_requote(mgr: TradingManager, event) -> bool:
+    """True if any resting maker quote is now mispriced against live sibling asks.
+
+    For neg-risk leg A the fair maker bid is
+        theoretical_A = (N-1) - Σ(best_ask_j, j≠A) - min_tick - 0.001
+    so when any *other* leg's ask moves, A's fair value moves too. Re-quote if a
+    resting bid is now above fair value (would fill at a loss — risk) or well
+    below it (leaving edge on the table — opportunity).
+    """
+    from config import REQUOTE_EDGE_THRESHOLD
+
+    no_ids = event.get_all_no_tokens()
+    n = len(no_ids)
+    if n < 2:
+        return False
+
+    asks: dict = {}
+    for tid in no_ids:
+        tok = mgr.tokens.get(tid)
+        if not tok or tok.best_ask is None:
+            return False  # incomplete data — don't act on a partial picture
+        asks[tid] = tok.best_ask
+    ask_sum = sum(asks.values())
+
+    for tid in no_ids:
+        order = mgr.active_orders.get(tid)
+        if not order:
             continue
-
-        if event_type == "price_change":
-            for price_update in msg.get("price_changes", []):
-                token_id = price_update.get("asset_id")
-                if not token_id:
-                    continue
-
-                token_obj = mgr.tokens.get(token_id)
-                if not token_obj or token_obj.token_type != "NO":
-                    continue
-
-                event = mgr.get_event_by_token(token_id)
-                if not event:
-                    continue
-
-                has_active = any(o.event_id == event.event_id for o in mgr.active_orders.values())
-                if not has_active:
-                    continue
-
-                new_best_ask = float(price_update["best_ask"])
-
-                if token_id in mgr.active_orders:
-                    initial_ask = mgr.active_orders[token_id].initial_market_ask
-                else:
-                    initial_ask = token_obj.best_ask
-
-                if initial_ask is not None and new_best_ask > initial_ask + 0.001:
-                    logger.warning(
-                        "[MarketWS] ASK WORSENED on %s: %.4f → %.4f",
-                        token_id, initial_ask, new_best_ask,
-                    )
-                    from orders import cancel_orders
-                    cancel_orders(mgr, event.get_all_no_tokens(), mgr.client)
-                    try_place_new_makers(mgr, event, mgr.client, cash_usdc=1600)
-                    if token_id in mgr.tokens:
-                        mgr.tokens[token_id].best_ask = new_best_ask
-
-        elif event_type == "book":
-            token_id = msg.get("asset_id")
-            if token_id in mgr.active_orders:
-                size = msg.get("asks", [{}])[0].get("size", "N/A")
-                logger.debug("[MarketWS] Book update for %s — best ask size: %s", token_id, size)
-
-        elif event_type in ("subscribed", "unsubscribed"):
-            logger.info("[MarketWS] Subscription ack: %s", msg)
-
-        elif event_type == "last_trade_price":
-            pass  # intentionally ignored
-
-        else:
-            logger.debug("[MarketWS] Unknown event_type '%s'", event_type)
+        market = mgr.get_market_by_token(tid)
+        min_tick = market.min_tick if market else 0.001
+        theoretical = (n - 1) - (ask_sum - asks[tid]) - min_tick - 0.001
+        if order.price > theoretical + 1e-6:
+            logger.info("[MarketWS] '%s' leg now unprofitable: bid %.4f > fair %.4f",
+                        event.title, order.price, theoretical)
+            return True
+        if order.price < theoretical - REQUOTE_EDGE_THRESHOLD:
+            logger.info("[MarketWS] '%s' leg too conservative: bid %.4f << fair %.4f",
+                        event.title, order.price, theoretical)
+            return True
+    return False

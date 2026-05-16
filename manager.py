@@ -8,6 +8,7 @@ from __future__ import annotations
 import logging
 import signal
 import sys
+import threading
 import time
 from typing import Any, Callable, Dict, List, Optional, Set, Tuple
 
@@ -30,6 +31,14 @@ class TradingManager:
         self.active_orders: Dict[str, OrderRecord] = {}    # token_id -> OrderRecord
         self.order_id_mapping: Dict[str, str] = {}         # order_id -> token_id
         self.positions: Dict[str, Dict] = {}               # token_id -> position info
+
+        # Concurrency — a single re-entrant lock guards all shared state above.
+        # The main loop, user-WS thread, and market-WS thread all acquire it.
+        self.lock = threading.RLock()
+
+        # Latest known collateral balance, published by the main loop so the
+        # WS-triggered re-quote path sizes against real funds (not a constant).
+        self.cash_usdc: float = 0.0
 
         # Active-event tracking
         self.active_events: Set[str] = set()
@@ -128,23 +137,24 @@ class TradingManager:
             return
 
         incoming_ids = {d[0] for d in raw_data if d[3]}
-        closed_ids = set(self.events.keys()) - incoming_ids
 
-        for event_id in closed_ids:
-            event = self.events.get(event_id)
-            if not event:
-                continue
-            active_tokens = [
-                tid for tid, o in self.active_orders.items() if o.event_id == event_id
-            ]
-            if active_tokens:
-                logger.info("[manager] Closing event '%s' — cancelling %d orders", event_id, len(active_tokens))
-                cancel_orders(self, active_tokens, self.client)
-            del self.events[event_id]
-            self.active_events.discard(event_id)
-            logger.info("[manager] Removed closed event '%s'", event_id)
+        with self.lock:
+            closed_ids = set(self.events.keys()) - incoming_ids
+            for event_id in closed_ids:
+                event = self.events.get(event_id)
+                if not event:
+                    continue
+                active_tokens = [
+                    tid for tid, o in self.active_orders.items() if o.event_id == event_id
+                ]
+                if active_tokens:
+                    logger.info("[manager] Closing event '%s' — cancelling %d orders", event_id, len(active_tokens))
+                    cancel_orders(self, active_tokens, self.client)
+                del self.events[event_id]
+                self.active_events.discard(event_id)
+                logger.info("[manager] Removed closed event '%s'", event_id)
 
-        self.process_api_response(raw_data)
+            self.process_api_response(raw_data)
         logger.info(
             "[manager] Refresh done — %d events, %d markets, %d tokens",
             len(self.events), len(self.markets), len(self.tokens),
@@ -248,8 +258,17 @@ class TradingManager:
             logger.info("[position] Cleared position for %s", token_id)
 
     def get_event_pnl(self, event: Event) -> Dict:
+        """PnL of the neg-risk NO basket.
+
+        Exactly one leg resolves YES (its NO pays $0); every other leg's NO
+        pays $1/share. If leg k resolves YES the payout is Σshares − shares_k,
+        so the *guaranteed* (worst-case) payout is Σshares − max(shares) — the
+        adversary picks the leg we hold most of. The old formula used
+        max(shares)·(N−1), which silently assumes a perfectly balanced basket
+        and overstates profit whenever hedging left the legs uneven.
+        """
         total_cost = 0.0
-        total_shares = 0.0
+        share_list: List[float] = []
         legs: Dict = {}
         for market in event.markets.values():
             tid = market.no_token.token_id
@@ -257,15 +276,22 @@ class TradingManager:
             shares = pos.get("shares", 0.0)
             cost = pos.get("total_cost", 0.0)
             total_cost += cost
-            total_shares = max(total_shares, shares)
+            share_list.append(shares)
             legs[tid] = {"shares": shares, "cost": cost}
-        n = len(event.markets)
-        profit = total_shares * (n - 1) - total_cost
+
+        total_shares = sum(share_list)
+        max_shares = max(share_list) if share_list else 0.0
+        min_shares = min(share_list) if share_list else 0.0
+        guaranteed_profit = (total_shares - max_shares) - total_cost
+        best_case_profit = (total_shares - min_shares) - total_cost
         return {
             "event": event.title,
             "total_cost": round(total_cost, 4),
-            "max_shares": round(total_shares, 4),
-            "theoretical_profit": round(profit, 4),
+            "max_shares": round(max_shares, 4),
+            "min_shares": round(min_shares, 4),
+            "guaranteed_profit": round(guaranteed_profit, 4),
+            "best_case_profit": round(best_case_profit, 4),
+            "theoretical_profit": round(guaranteed_profit, 4),  # back-compat key
             "legs": legs,
         }
 
@@ -276,32 +302,66 @@ class TradingManager:
 
     # ── Order clean-up ─────────────────────────────────────────────────────────
 
-    def cleanup_expired_orders(self) -> None:
-        expired = [tid for tid, o in self.active_orders.items() if o.is_expired()]
+    def _drop_expired(self, candidates: List[str]) -> None:
+        """Reconcile and remove expired orders.
+
+        An order is only dropped once it is past the expiry grace window. A GTD
+        maker order can match in its final moments, so before discarding one we
+        re-poll the exchange — if it actually filled, route it through hedging
+        rather than silently losing the fill (which would leave an unhedged leg).
+        """
+        from config import ORDER_EXPIRY_GRACE_SECONDS
+
+        expired = [
+            tid for tid in candidates
+            if tid in self.active_orders
+            and self.active_orders[tid].is_past_grace(ORDER_EXPIRY_GRACE_SECONDS)
+        ]
+        events_to_hedge: Set[str] = set()
         event_ids: Set[str] = set()
         for tid in expired:
-            order = self.active_orders[tid]
+            order = self.active_orders.get(tid)
+            if not order:
+                continue
             event_ids.add(order.event_id)
+
+            filled = order.matched_amount or 0.0
+            if filled <= 0:
+                try:
+                    resp = self.client.get_order(order.order_id)
+                    filled = float(resp.get("size_matched", 0) or 0)
+                except Exception as exc:
+                    logger.warning("[manager] Expiry reconcile failed for %s: %s",
+                                   order.order_id, exc)
+            if filled > 0:
+                order.matched_amount = filled
+                events_to_hedge.add(order.event_id)
+                logger.warning("[manager] Expired order %s filled %.2f — routing to hedge",
+                               order.order_id, filled)
+                continue  # leave tracked; hedge_event will cancel & remove it
+
             self.order_id_mapping.pop(order.order_id, None)
-            del self.active_orders[tid]
+            self.active_orders.pop(tid, None)
             logger.info("[manager] Cleaned up expired order %s", order.order_id)
+
+        for eid in events_to_hedge:
+            event = self.events.get(eid)
+            if event:
+                from orders import hedge_event
+                hedge_event(self, event, self.client)
         for eid in event_ids:
             self.check_and_deactivate_event(eid)
 
+    def cleanup_expired_orders(self) -> None:
+        with self.lock:
+            self._drop_expired(list(self.active_orders.keys()))
+
     def cleanup_expired_orders_of_event(self, event: Event) -> None:
-        expired = [
-            tid for tid, o in self.active_orders.items()
-            if o.is_expired() and o.event_id == event.event_id
-        ]
-        event_ids: Set[str] = set()
-        for tid in expired:
-            order = self.active_orders[tid]
-            event_ids.add(order.event_id)
-            self.order_id_mapping.pop(order.order_id, None)
-            del self.active_orders[tid]
-            logger.info("[manager] Cleaned up expired order %s", order.order_id)
-        for eid in event_ids:
-            self.check_and_deactivate_event(eid)
+        with self.lock:
+            self._drop_expired([
+                tid for tid, o in self.active_orders.items()
+                if o.event_id == event.event_id
+            ])
 
     # ── Shutdown ───────────────────────────────────────────────────────────────
 

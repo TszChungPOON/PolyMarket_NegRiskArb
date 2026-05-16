@@ -124,7 +124,21 @@ def try_place_new_makers(
     client,
     cash_usdc: float = 0.0,
 ) -> None:
-    """Evaluate a neg-risk event and post limit BUY orders on NO tokens."""
+    """Evaluate a neg-risk event and post limit BUY orders on NO tokens.
+
+    Thin lock-guarded wrapper — the placement run holds the manager lock for its
+    full duration so a hedge or another re-quote cannot interleave mid-event.
+    """
+    with manager.lock:
+        _try_place_new_makers_locked(manager, event, client, cash_usdc)
+
+
+def _try_place_new_makers_locked(
+    manager: TradingManager,
+    event,
+    client,
+    cash_usdc: float = 0.0,
+) -> None:
     no_token_ids = event.get_all_no_tokens()
     if not no_token_ids:
         return
@@ -286,6 +300,9 @@ def market_making() -> None:
             except Exception as exc:
                 logger.warning("[loop] Balance fetch failed: %s", exc)
                 cash_usdc = 0.0
+
+            # Publish balance so the WS re-quote path sizes against real funds.
+            manager.cash_usdc = cash_usdc
 
             for event in candidates:
                 try_place_new_makers(manager, event, client, cash_usdc=cash_usdc)

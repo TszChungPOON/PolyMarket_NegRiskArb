@@ -151,6 +151,10 @@ class OrderRecord:
     def is_expired(self) -> bool:
         return time.time() > self.expiration
 
+    def is_past_grace(self, grace: float) -> bool:
+        """True once the order is `grace` seconds past its exchange expiration."""
+        return time.time() > self.expiration + grace
+
     def to_dict(self) -> Dict:
         return {
             "order_id": self.order_id,
